@@ -1,0 +1,808 @@
+//@version=5
+indicator("Quantio [Pro+] New V1", overlay=true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, dynamic_requests=true)
+
+
+// === 🎨 PALETTE PREMIUM ===
+c_buy_main    = #00897B  // Teal
+c_sell_main   = #E53935  // Rouge
+c_signal_bar  = #2962FF  // Bleu Roi
+c_text_dark   = #131722  // Noir (Dark Background)
+c_text_light  = #FFFFFF  // Blanc
+c_win         = #00C853  // Vert Win
+c_loss        = #B0BEC5  // Gris Loss
+c_candle_neutral = #787B86 // Explicit Grey
+// --- Track which bar triggered the signal ---
+var int signal_trigger_bar = na
+// === Input Settings ===
+lookback_length = 10
+x = 25 
+box_display = "Both Boxes" 
+signal_label_size = size.small 
+atr_len_input = 14
+atr_offset_mult = 0.5 
+show_line_fill_active = true
+persistent_line_width = 1
+enable_grey_candles = input.bool(true, title="Grey Candles on Neutral", group="Visual Settings")
+filter_lookback = 5
+backtesting_mode = input.bool(false, title="Backtesting Mode (Hide MTF Dashboard)", group="Performance")
+enable_htf_supertrend = input.bool(true, title="Enable HTF Supertrend Filter", group="HTF Supertrend")
+htf_multiplier = 2
+supertrend_period = 10
+supertrend_multiplier = 3
+signal_filter = input.string("All Signals", title="Signal Filter", options=["All Signals", "BUY Only", "SELL Only"], group="Visual Settings")
+
+
+
+// === RSI Settings ===
+rsi_length = 14
+rsi_source = close
+rsi_value = ta.rsi(rsi_source, rsi_length)
+crossover_30 = ta.crossover(rsi_value, 30)
+crossover_70 = ta.crossunder(rsi_value, 70)
+
+enable_alerts = input.bool(true, title="Enable Alert")
+
+// === Fractal Detection ===
+up_fractal = ta.highest(high, 5) == high[2] and high[2] > high[1] and high[2] > high[3] and high[2] > high[0] and high[2] > high[4]
+down_fractal = ta.lowest(low, 5) == low[2] and low[2] < low[1] and low[2] < low[3] and low[2] < low[0] and low[2] < low[4]
+var float last_up_fractal_high = na
+var int last_up_fractal_index = na
+if up_fractal
+    last_up_fractal_high := high[2]
+    last_up_fractal_index := bar_index[2]
+var float last_down_fractal_low = na
+var int last_down_fractal_index = na
+if down_fractal
+    last_down_fractal_low := low[2]
+    last_down_fractal_index := bar_index[2]
+
+// === High/Low Logic ===
+lowest_low = ta.lowest(low, lookback_length)
+var int lowest_low_index = na
+lowest_low_real_index = bar_index
+for i = 0 to lookback_length - 1
+    if low[i] == lowest_low
+        lowest_low_index := i
+        lowest_low_real_index := bar_index[i]
+        break
+highest_high = ta.highest(high, lookback_length)
+var int highest_high_index = na
+highest_high_real_index = bar_index
+for i = 0 to lookback_length - 1
+    if high[i] == highest_high
+        highest_high_index := i
+        highest_high_real_index := bar_index[i]
+        break
+var float updated_buy_fractal_level = na
+if not na(lowest_low_real_index) and not na(last_up_fractal_index)
+    if last_up_fractal_index < lowest_low_real_index
+        updated_buy_fractal_level := last_up_fractal_high
+var float updated_sell_fractal_level = na
+if not na(highest_high_real_index) and not na(last_down_fractal_index)
+    if last_down_fractal_index < highest_high_real_index
+        updated_sell_fractal_level := last_down_fractal_low
+
+// === RSI Cross Recency ===
+recent_crossover_30 = false
+recent_crossover_70 = false
+for i = 0 to 19
+    if crossover_30[i]
+        recent_crossover_30 := true
+        break
+for i = 0 to 19
+    if crossover_70[i]
+        recent_crossover_70 := true
+        break
+
+// === Reset Signal Triggers ===
+var bool buy_signal_triggered = false
+var bool sell_signal_triggered = false
+if crossover_30
+    buy_signal_triggered := false
+if crossover_70
+    sell_signal_triggered := false
+
+// === Confirmation Candle Logic ===
+body_size = math.abs(close[1] - open[1])
+candle_range = high[1] - low[1]
+body_to_range_ratio = candle_range > 0 ? body_size / candle_range : 0
+bull_confirm = not na(updated_buy_fractal_level) and close[1] > open[1] and close[1] > updated_buy_fractal_level and body_to_range_ratio > 0.5
+bear_confirm = not na(updated_sell_fractal_level) and close[1] < open[1] and close[1] < updated_sell_fractal_level and body_to_range_ratio > 0.5
+
+
+// === Close Price Filter ===
+highest_high_filter = ta.highest(high, filter_lookback)
+lowest_low_filter = ta.lowest(low, filter_lookback)
+
+// Check filter on previous bar (where signal confirmation happens)
+// For BUY: blue candle close must be > highest HIGH of last X bars
+// For SELL: blue candle close must be < lowest LOW of last X bars
+buy_close_filter = close[1] > highest_high_filter[2]
+sell_close_filter = close[1] < lowest_low_filter[2]
+
+
+// === TP1 Invalidation Filter ===
+// Calculate what TP1 would be for this potential signal
+potential_buy_tp1 = na(updated_buy_fractal_level[1]) or na(lowest_low[1]) ? na : updated_buy_fractal_level[1] + (updated_buy_fractal_level[1] - lowest_low[1])
+potential_sell_tp1 = na(updated_sell_fractal_level[1]) or na(highest_high[1]) ? na : updated_sell_fractal_level[1] - (highest_high[1] - updated_sell_fractal_level[1])
+
+// For BUY: if blue candle high touches/exceeds TP1 -> invalidate
+buy_tp1_filter = na(potential_buy_tp1) ? true : high[1] < potential_buy_tp1
+
+// For SELL: if blue candle low touches/reaches TP1 -> invalidate  
+sell_tp1_filter = na(potential_sell_tp1) ? true : low[1] > potential_sell_tp1
+
+// Function to calculate HTF timeframe automatically
+f_get_htf_timeframe(multiplier) =>
+    current_tf_in_minutes = timeframe.in_seconds() / 60
+    htf_minutes = current_tf_in_minutes * multiplier
+    
+    // Convert to appropriate timeframe string
+    if htf_minutes < 60
+        str.tostring(math.round(htf_minutes))
+    else if htf_minutes < 1440  // Less than 1 day
+        str.tostring(math.round(htf_minutes / 60))
+    else if htf_minutes < 10080  // Less than 1 week
+        str.tostring(math.round(htf_minutes / 1440)) + "D"
+    else if htf_minutes < 43200  // Less than 1 month
+        str.tostring(math.round(htf_minutes / 10080)) + "W"
+    else
+        str.tostring(math.round(htf_minutes / 43200)) + "M"
+
+htf_timeframe = f_get_htf_timeframe(htf_multiplier)
+
+// Supertrend calculation function
+f_supertrend(factor, atr_period) =>
+    src = hl2
+    atr_value = ta.atr(atr_period)
+    upper_band = src + (factor * atr_value)
+    lower_band = src - (factor * atr_value)
+    
+    var float supertrend = na
+    var int direction = 1
+    
+    prev_supertrend = nz(supertrend[1], lower_band)
+    prev_direction = nz(direction[1], 1)
+    
+    if na(atr_value[1])
+        direction := 1
+        supertrend := lower_band
+    else
+        if prev_direction == 1
+            supertrend := lower_band > prev_supertrend ? lower_band : prev_supertrend
+        else
+            supertrend := upper_band < prev_supertrend ? upper_band : prev_supertrend
+        
+        direction := close > supertrend ? 1 : -1
+        
+        if direction != prev_direction
+            supertrend := direction == 1 ? lower_band : upper_band
+    
+    [supertrend, direction]
+
+// Get HTF Supertrend
+[htf_supertrend_line, htf_supertrend_direction] = request.security(syminfo.tickerid, htf_timeframe, f_supertrend(supertrend_multiplier, supertrend_period), lookahead=barmerge.lookahead_off)
+
+// Filter logic: Only allow trades aligned with HTF Supertrend
+htf_st_allows_buy = not enable_htf_supertrend or htf_supertrend_direction == 1
+htf_st_allows_sell = not enable_htf_supertrend or htf_supertrend_direction == -1
+
+buy_signal_allowed = signal_filter == "All Signals" or signal_filter == "BUY Only"
+sell_signal_allowed = signal_filter == "All Signals" or signal_filter == "SELL Only"
+
+// === Final Signal Conditions ===
+buy_signal_condition = buy_signal_allowed and not buy_signal_triggered[1] and recent_crossover_30[1] and
+     not na(updated_buy_fractal_level[1]) and
+     not na(lowest_low[1]) and
+     not na(last_up_fractal_index[1]) and
+     (updated_buy_fractal_level[1] - lowest_low[1]) > 0 and
+     close[1] > updated_buy_fractal_level[1] and
+     bull_confirm[0] and
+     buy_close_filter and
+     buy_tp1_filter and
+     htf_st_allows_buy
+
+sell_signal_condition = sell_signal_allowed and not sell_signal_triggered[1] and recent_crossover_70[1] and
+     not na(updated_sell_fractal_level[1]) and
+     not na(highest_high[1]) and
+     not na(last_down_fractal_index[1]) and
+     (highest_high[1] - updated_sell_fractal_level[1]) > 0 and
+     close[1] < updated_sell_fractal_level[1] and
+     bear_confirm[0] and
+     sell_close_filter and
+     sell_tp1_filter and
+     htf_st_allows_sell
+
+
+// === Trade Management & Drawing Variables ===
+var bool is_buy_trade_active = false
+var bool is_sell_trade_active = false
+
+// --- Active Trade Parameters ---
+var float active_buy_tp1 = na
+var float active_buy_tp2 = na
+var float active_buy_sl = na
+var float active_buy_entry = na
+var int   active_buy_start_bar_idx = na
+var int   active_buy_confirm_bar_idx = na
+var float active_buy_wr_tp1 = na
+var float active_buy_wr_tp2 = na
+
+var float active_sell_tp1 = na
+var float active_sell_tp2 = na
+var float active_sell_sl = na
+var float active_sell_entry = na
+var int   active_sell_start_bar_idx = na
+var int   active_sell_confirm_bar_idx = na
+var float active_sell_wr_tp1 = na
+var float active_sell_wr_tp2 = na
+
+// --- Arrays to store ACTIVE drawing IDs ---
+var line[] buy_lines = array.new_line()
+var label[] buy_labels = array.new_label()
+var box[] buy_boxes = array.new_box()
+var linefill[] buy_fills = array.new_linefill()
+var line[] sell_lines = array.new_line()
+var label[] sell_labels = array.new_label()
+var box[] sell_boxes = array.new_box()
+var linefill[] sell_fills = array.new_linefill()
+
+// --- Helper: DELETE drawings ---
+f_delete_active_drawings(lines_array, labels_array, boxes_array, fills_array) =>
+    for line_id in lines_array
+        line.delete(line_id)
+    for label_id in labels_array
+        label.delete(label_id)
+    for box_id in boxes_array
+        box.delete(box_id)
+    for fill_id in fills_array
+        linefill.delete(fill_id)
+    array.clear(lines_array)
+    array.clear(labels_array)
+    array.clear(boxes_array)
+    array.clear(fills_array)
+
+// --- Helper: SNAP END (Surgical Finish) ---
+f_snap_drawings_to_bar(lines_array, boxes_array, target_bar_index) =>
+    if array.size(lines_array) > 0
+        for i = 0 to array.size(lines_array) - 1
+            line.set_x2(array.get(lines_array, i), target_bar_index)
+    if array.size(boxes_array) > 0
+        for i = 0 to array.size(boxes_array) - 1
+            box.set_right(array.get(boxes_array, i), target_bar_index)
+
+// --- Helper: ARCHIVE drawings (Freeze arrays + Delete labels) ---
+f_archive_active_drawings(lines_array, labels_array, boxes_array, fills_array) =>
+    array.clear(lines_array)
+    array.clear(boxes_array)
+    array.clear(fills_array)
+    if array.size(labels_array) > 0
+        for i = 0 to array.size(labels_array) - 1
+            label.delete(array.get(labels_array, i))
+    array.clear(labels_array)
+
+// === Win Rate Calculation Logic ===
+var int buy_win_count_tp2 = 0
+var int buy_loss_count = 0
+var int buy_tp1_hit_count = 0
+var int sell_win_count_tp2 = 0
+var int sell_loss_count = 0
+var int sell_tp1_hit_count = 0
+
+var bool tp1_was_hit_this_trade = false 
+
+total_buy_trades = buy_win_count_tp2 + buy_loss_count
+total_sell_trades = sell_win_count_tp2 + sell_loss_count
+
+wr_tp1_buy = total_buy_trades > 0 ? (buy_tp1_hit_count / total_buy_trades) * 100 : 0.0
+wr_tp1_sell = total_sell_trades > 0 ? (sell_tp1_hit_count / total_sell_trades) * 100 : 0.0
+wr_tp2_buy = total_buy_trades > 0 ? (buy_win_count_tp2 / total_buy_trades) * 100 : 0.0
+wr_tp2_sell = total_sell_trades > 0 ? (sell_win_count_tp2 / total_sell_trades) * 100 : 0.0
+
+f_format_pct(value) => str.tostring(value, "#.##") + "%"
+
+
+
+// === HTF Data Fetching ===
+f_get_active_trade_probs() =>
+    is_buy = is_buy_trade_active[1]
+    is_sell = is_sell_trade_active[1]
+    b_tp1_p = is_buy ? nz(active_buy_wr_tp1[1], 0.0) : na
+    b_tp2_p = is_buy ? nz(active_buy_wr_tp2[1], 0.0) : na
+    s_tp1_p = is_sell ? nz(active_sell_wr_tp1[1], 0.0) : na
+    s_tp2_p = is_sell ? nz(active_sell_wr_tp2[1], 0.0) : na
+    [is_buy, is_sell, b_tp1_p, b_tp2_p, s_tp1_p, s_tp2_p]
+
+f_get_tp1_hit_status() =>
+    [is_buy_trade_active[1] ? tp1_was_hit_this_trade[1] : false, is_sell_trade_active[1] ? tp1_was_hit_this_trade[1] : false]
+
+[m1_is_buy, m1_is_sell, m1_b_tp1_p, m1_b_tp2_p, m1_s_tp1_p, m1_s_tp2_p] = request.security(syminfo.tickerid, "1", f_get_active_trade_probs(), lookahead=barmerge.lookahead_off)
+[m5_is_buy, m5_is_sell, m5_b_tp1_p, m5_b_tp2_p, m5_s_tp1_p, m5_s_tp2_p] = request.security(syminfo.tickerid, "5", f_get_active_trade_probs(), lookahead=barmerge.lookahead_off)
+[m15_is_buy, m15_is_sell, m15_b_tp1_p, m15_b_tp2_p, m15_s_tp1_p, m15_s_tp2_p] = request.security(syminfo.tickerid, "15", f_get_active_trade_probs(), lookahead=barmerge.lookahead_off)
+[m30_is_buy, m30_is_sell, m30_b_tp1_p, m30_b_tp2_p, m30_s_tp1_p, m30_s_tp2_p] = request.security(syminfo.tickerid, "30", f_get_active_trade_probs(), lookahead=barmerge.lookahead_off)
+[h1_is_buy, h1_is_sell, h1_b_tp1_p, h1_b_tp2_p, h1_s_tp1_p, h1_s_tp2_p] = request.security(syminfo.tickerid, "60", f_get_active_trade_probs(), lookahead=barmerge.lookahead_off)
+[h4_is_buy, h4_is_sell, h4_b_tp1_p, h4_b_tp2_p, h4_s_tp1_p, h4_s_tp2_p] = request.security(syminfo.tickerid, "240", f_get_active_trade_probs(), lookahead=barmerge.lookahead_off)
+[d1_is_buy, d1_is_sell, d1_b_tp1_p, d1_b_tp2_p, d1_s_tp1_p, d1_s_tp2_p] = request.security(syminfo.tickerid, "D", f_get_active_trade_probs(), lookahead=barmerge.lookahead_off)
+[m1_b_tp1_h, m1_s_tp1_h] = request.security(syminfo.tickerid, "1", f_get_tp1_hit_status(), lookahead=barmerge.lookahead_on)
+[m5_b_tp1_h, m5_s_tp1_h] = request.security(syminfo.tickerid, "5", f_get_tp1_hit_status(), lookahead=barmerge.lookahead_on)
+[m15_b_tp1_h, m15_s_tp1_h] = request.security(syminfo.tickerid, "15", f_get_tp1_hit_status(), lookahead=barmerge.lookahead_on)
+[m30_b_tp1_h, m30_s_tp1_h] = request.security(syminfo.tickerid, "30", f_get_tp1_hit_status(), lookahead=barmerge.lookahead_on)
+[h1_b_tp1_h, h1_s_tp1_h] = request.security(syminfo.tickerid, "60", f_get_tp1_hit_status(), lookahead=barmerge.lookahead_on)
+[h4_b_tp1_h, h4_s_tp1_h] = request.security(syminfo.tickerid, "240", f_get_tp1_hit_status(), lookahead=barmerge.lookahead_on)
+[d1_b_tp1_h, d1_s_tp1_h] = request.security(syminfo.tickerid, "D", f_get_tp1_hit_status(), lookahead=barmerge.lookahead_on)
+
+type HtfData
+    string tf_name
+    bool is_buy
+    bool is_sell
+    float buy_tp1_prob
+    float buy_tp2_prob
+    bool buy_tp1_hit
+    float sell_tp1_prob
+    float sell_tp2_prob
+    bool sell_tp1_hit
+
+htf_data_array = array.new<HtfData>()
+array.push(htf_data_array, HtfData.new("M1", nz(m1_is_buy), nz(m1_is_sell), nz(m1_b_tp1_p), nz(m1_b_tp2_p), nz(m1_b_tp1_h), nz(m1_s_tp1_p), nz(m1_s_tp2_p), nz(m1_s_tp1_h)))
+array.push(htf_data_array, HtfData.new("M5", nz(m5_is_buy), nz(m5_is_sell), nz(m5_b_tp1_p), nz(m5_b_tp2_p), nz(m5_b_tp1_h), nz(m5_s_tp1_p), nz(m5_s_tp2_p), nz(m5_s_tp1_h)))
+array.push(htf_data_array, HtfData.new("M15", nz(m15_is_buy), nz(m15_is_sell), nz(m15_b_tp1_p), nz(m15_b_tp2_p), nz(m15_b_tp1_h), nz(m15_s_tp1_p), nz(m15_s_tp2_p), nz(m15_s_tp1_h)))
+array.push(htf_data_array, HtfData.new("M30", nz(m30_is_buy), nz(m30_is_sell), nz(m30_b_tp1_p), nz(m30_b_tp2_p), nz(m30_b_tp1_h), nz(m30_s_tp1_p), nz(m30_s_tp2_p), nz(m30_s_tp1_h)))
+array.push(htf_data_array, HtfData.new("H1", nz(h1_is_buy), nz(h1_is_sell), nz(h1_b_tp1_p), nz(h1_b_tp2_p), nz(h1_b_tp1_h), nz(h1_s_tp1_p), nz(h1_s_tp2_p), nz(h1_s_tp1_h)))
+array.push(htf_data_array, HtfData.new("H4", nz(h4_is_buy), nz(h4_is_sell), nz(h4_b_tp1_p), nz(h4_b_tp2_p), nz(h4_b_tp1_h), nz(h4_s_tp1_p), nz(h4_s_tp2_p), nz(h4_s_tp1_h)))
+array.push(htf_data_array, HtfData.new("D1", nz(d1_is_buy), nz(d1_is_sell), nz(d1_b_tp1_p), nz(d1_b_tp2_p), nz(d1_b_tp1_h), nz(d1_s_tp1_p), nz(d1_s_tp2_p), nz(d1_s_tp1_h)))
+
+// === Probability Adjustment ===
+f_adjust_probabilities(base_tp1_prob, base_tp2_prob, is_current_trade_buy) =>
+    adj_tp1 = base_tp1_prob
+    adj_tp2 = base_tp2_prob
+    for i = 0 to array.size(htf_data_array) - 1
+        htf = array.get(htf_data_array, i)
+        htf_is_active = htf.is_buy or htf.is_sell
+        if not htf_is_active
+            continue
+        htf_is_buy_trade = htf.is_buy
+        htf_tp1_prob = htf_is_buy_trade ? htf.buy_tp1_prob : htf.sell_tp1_prob
+        htf_tp2_prob = htf_is_buy_trade ? htf.buy_tp2_prob : htf.sell_tp2_prob
+        htf_tp1_hit = htf_is_buy_trade ? htf.buy_tp1_hit : htf.sell_tp1_hit
+        bool directions_match = (is_current_trade_buy and htf_is_buy_trade) or (not is_current_trade_buy and not htf_is_buy_trade)
+        if directions_match 
+            if not htf_tp1_hit
+                if htf_tp1_prob > 50
+                    adj_tp1 += 10.0
+                    adj_tp2 += 10.0
+                else
+                    adj_tp1 -= 10.0
+                    adj_tp2 -= 10.0
+            else 
+                if htf_tp2_prob > 50
+                    adj_tp1 += 5.0
+                    adj_tp2 += 5.0
+                else
+                    adj_tp1 -= 5.0
+                    adj_tp2 -= 5.0
+        else 
+            if not htf_tp1_hit
+                if htf_tp1_prob > 50
+                    adj_tp1 -= 10.0
+                    adj_tp2 -= 10.0
+                else
+                    adj_tp1 += 5.0
+                    adj_tp2 += 5.0
+            else 
+                if htf_tp2_prob > 50
+                    adj_tp1 -= 5.0
+                    adj_tp2 -= 5.0
+                else
+                    adj_tp1 += 5.0
+                    adj_tp2 += 5.0
+    final_tp1 = math.max(0.0, math.min(100.0, adj_tp1))
+    final_tp2 = math.max(0.0, math.min(100.0, adj_tp2))
+    [final_tp1, final_tp2]
+
+// --- Trade Entry Logic ---
+if buy_signal_condition and not is_buy_trade_active and not is_sell_trade_active
+    f_delete_active_drawings(buy_lines, buy_labels, buy_boxes, buy_fills)
+    if is_sell_trade_active
+        f_delete_active_drawings(sell_lines, sell_labels, sell_boxes, sell_fills)
+        is_sell_trade_active := false
+
+    is_buy_trade_active := true
+    signal_trigger_bar := bar_index - 1  // ADD THIS LINE - marks the previous bar
+
+    tp1_was_hit_this_trade := false 
+
+    current_lowest_low = lowest_low[1]
+    current_updated_buy_fractal_level = updated_buy_fractal_level[1]
+    current_box_distance = current_updated_buy_fractal_level - current_lowest_low
+    active_buy_sl := current_lowest_low
+    active_buy_entry := current_updated_buy_fractal_level
+    active_buy_tp1 := active_buy_entry + current_box_distance
+    active_buy_tp2 := active_buy_entry + 2 * current_box_distance
+    active_buy_start_bar_idx := last_up_fractal_index[1]
+    active_buy_confirm_bar_idx := bar_index
+    buy_signal_triggered := true
+
+    active_buy_wr_tp1 := wr_tp1_buy
+    active_buy_wr_tp2 := wr_tp2_buy
+
+    [adjusted_buy_tp1_prob, adjusted_buy_tp2_prob] = f_adjust_probabilities(active_buy_wr_tp1, active_buy_wr_tp2, true)
+
+    // CALCUL DU RATIO (TP2 vs SL)
+    buy_dist_sl = math.abs(active_buy_entry - active_buy_sl)
+    buy_dist_tp2 = math.abs(active_buy_entry - active_buy_tp2)
+    buy_ratio = buy_dist_sl > 0 ? buy_dist_tp2 / buy_dist_sl : 0
+
+    box_left_persistent = active_buy_start_bar_idx
+    box_right_persistent = active_buy_confirm_bar_idx
+    if box_display == "Both Boxes" or box_display == "Second Box Only"
+        box.new(left=box_left_persistent, right=box_right_persistent, top=active_buy_entry, bottom=active_buy_sl, border_color=color.new(c_buy_main, 80), bgcolor=color.new(c_buy_main, 95))
+
+    line.new(box_left_persistent, active_buy_sl, box_right_persistent, active_buy_sl, color=color.new(c_buy_main, 30), style=line.style_solid, width=persistent_line_width)
+    line.new(box_left_persistent, active_buy_entry, box_right_persistent, active_buy_entry, color=color.new(c_buy_main, 30), style=line.style_solid, width=persistent_line_width)
+    
+    line_end_x_active = active_buy_confirm_bar_idx + x
+
+    if box_display == "Both Boxes" or box_display == "Second Box Only"
+        active_box = box.new(left=active_buy_start_bar_idx, right=active_buy_confirm_bar_idx, top=active_buy_entry, bottom=active_buy_sl, border_color=color.new(c_buy_main, 80), bgcolor=color.new(c_buy_main, 92))
+        array.push(buy_boxes, active_box)
+
+    line_sl = line.new(active_buy_start_bar_idx, active_buy_sl, line_end_x_active, active_buy_sl, color=color.new(c_sell_main, 20), style=line.style_solid, width=1)
+    line_entry = line.new(active_buy_start_bar_idx, active_buy_entry, line_end_x_active, active_buy_entry, color=color.new(c_buy_main, 20), style=line.style_solid, width=1)
+    line_tp1 = line.new(active_buy_start_bar_idx, active_buy_tp1, line_end_x_active, active_buy_tp1, color=color.new(c_buy_main, 40), style=line.style_dashed, width=1)
+    line_tp2 = line.new(active_buy_start_bar_idx, active_buy_tp2, line_end_x_active, active_buy_tp2, color=color.new(c_buy_main, 40), style=line.style_dashed, width=1)
+    array.push(buy_lines, line_sl)
+    array.push(buy_lines, line_entry)
+    array.push(buy_lines, line_tp1)
+    array.push(buy_lines, line_tp2)
+
+    // === MODIFIED BUY LABELS (Solid Color + White Text) ===
+    label_sl = label.new(line_end_x_active, active_buy_sl, "SL " + str.tostring(active_buy_sl, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, color = c_sell_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    
+    label_entry = label.new(line_end_x_active, active_buy_entry, "Entry " + str.tostring(active_buy_entry, format.mintick) + " (Ratio: " + str.tostring(buy_ratio, "#.#") + ")", xloc = xloc.bar_index, yloc = yloc.price, color = c_buy_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    
+    label_tp1 = label.new(line_end_x_active, active_buy_tp1, "TP1 " + str.tostring(active_buy_tp1, format.mintick) + " (" + f_format_pct(adjusted_buy_tp1_prob) + ")", xloc = xloc.bar_index, yloc = yloc.price, color = c_buy_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    label_tp2 = label.new(line_end_x_active, active_buy_tp2, "TP2 " + str.tostring(active_buy_tp2, format.mintick) + " (" + f_format_pct(adjusted_buy_tp2_prob) + ")", xloc = xloc.bar_index, yloc = yloc.price, color = c_buy_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    
+    array.push(buy_labels, label_sl)
+    array.push(buy_labels, label_entry)
+    array.push(buy_labels, label_tp1)
+    array.push(buy_labels, label_tp2)
+
+    if show_line_fill_active
+        fill_sl_entry = linefill.new(line_sl, line_entry, color=color.new(c_sell_main, 95))
+        fill_entry_tp2 = linefill.new(line_entry, line_tp2, color=color.new(c_buy_main, 95))
+        array.push(buy_fills, fill_sl_entry)
+        array.push(buy_fills, fill_entry_tp2)
+
+
+if sell_signal_condition and not is_sell_trade_active and not is_buy_trade_active
+    f_delete_active_drawings(sell_lines, sell_labels, sell_boxes, sell_fills)
+    if is_buy_trade_active
+        f_delete_active_drawings(buy_lines, buy_labels, buy_boxes, buy_fills)
+        is_buy_trade_active := false
+
+    is_sell_trade_active := true
+    signal_trigger_bar := bar_index - 1  // ADD THIS LINE - marks the previous bar
+
+    tp1_was_hit_this_trade := false 
+
+    current_highest_high = highest_high[1]
+    current_updated_sell_fractal_level = updated_sell_fractal_level[1]
+    current_box_distance = current_highest_high - current_updated_sell_fractal_level
+    active_sell_sl := current_highest_high
+    active_sell_entry := current_updated_sell_fractal_level
+    active_sell_tp1 := active_sell_entry - current_box_distance
+    active_sell_tp2 := active_sell_entry - 2 * current_box_distance
+    active_sell_start_bar_idx := last_down_fractal_index[1]
+    active_sell_confirm_bar_idx := bar_index
+    sell_signal_triggered := true
+
+    active_sell_wr_tp1 := wr_tp1_sell
+    active_sell_wr_tp2 := wr_tp2_sell
+
+    [adjusted_sell_tp1_prob, adjusted_sell_tp2_prob] = f_adjust_probabilities(active_sell_wr_tp1, active_sell_wr_tp2, false)
+
+    // CALCUL DU RATIO (TP2 vs SL)
+    sell_dist_sl = math.abs(active_sell_sl - active_sell_entry)
+    sell_dist_tp2 = math.abs(active_sell_entry - active_sell_tp2)
+    sell_ratio = sell_dist_sl > 0 ? sell_dist_tp2 / sell_dist_sl : 0
+
+    box_left_persistent = active_sell_start_bar_idx
+    box_right_persistent = active_sell_confirm_bar_idx
+    if box_display == "Both Boxes" or box_display == "Second Box Only"
+        box.new(left=box_left_persistent, right=box_right_persistent, top=active_sell_sl, bottom=active_sell_entry, border_color=color.new(c_sell_main, 80), bgcolor=color.new(c_sell_main, 95))
+
+    line.new(box_left_persistent, active_sell_sl, box_right_persistent, active_sell_sl, color=color.new(c_sell_main, 30), style=line.style_solid, width=persistent_line_width)
+    line.new(box_left_persistent, active_sell_entry, box_right_persistent, active_sell_entry, color=color.new(c_sell_main, 30), style=line.style_solid, width=persistent_line_width)
+    
+    line_end_x_active = active_sell_confirm_bar_idx + x
+
+    if box_display == "Both Boxes" or box_display == "Second Box Only"
+        active_box = box.new(left=active_sell_start_bar_idx, right=active_sell_confirm_bar_idx, top=active_sell_sl, bottom=active_sell_entry, border_color=color.new(c_sell_main, 80), bgcolor=color.new(c_sell_main, 92))
+        array.push(sell_boxes, active_box)
+
+    line_sl = line.new(active_sell_start_bar_idx, active_sell_sl, line_end_x_active, active_sell_sl, color=color.new(c_sell_main, 20), style=line.style_solid, width=1)
+    line_entry = line.new(active_sell_start_bar_idx, active_sell_entry, line_end_x_active, active_sell_entry, color=color.new(c_sell_main, 20), style=line.style_solid, width=1)
+    line_tp1 = line.new(active_sell_start_bar_idx, active_sell_tp1, line_end_x_active, active_sell_tp1, color=color.new(c_sell_main, 40), style=line.style_dashed, width=1)
+    line_tp2 = line.new(active_sell_start_bar_idx, active_sell_tp2, line_end_x_active, active_sell_tp2, color=color.new(c_sell_main, 40), style=line.style_dashed, width=1)
+    array.push(sell_lines, line_sl)
+    array.push(sell_lines, line_entry)
+    array.push(sell_lines, line_tp1)
+    array.push(sell_lines, line_tp2)
+
+    // === MODIFIED SELL LABELS (Solid Color + White Text) ===
+    label_sl = label.new(line_end_x_active, active_sell_sl, "SL " + str.tostring(active_sell_sl, format.mintick), xloc = xloc.bar_index, yloc = yloc.price, color = c_sell_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    
+    label_entry = label.new(line_end_x_active, active_sell_entry, "Entry " + str.tostring(active_sell_entry, format.mintick) + " (Ratio: " + str.tostring(sell_ratio, "#.#") + ")", xloc = xloc.bar_index, yloc = yloc.price, color = c_sell_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    
+    label_tp1 = label.new(line_end_x_active, active_sell_tp1, "TP1 " + str.tostring(active_sell_tp1, format.mintick) + " (" + f_format_pct(adjusted_sell_tp1_prob) + ")", xloc = xloc.bar_index, yloc = yloc.price, color = c_sell_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    label_tp2 = label.new(line_end_x_active, active_sell_tp2, "TP2 " + str.tostring(active_sell_tp2, format.mintick) + " (" + f_format_pct(adjusted_sell_tp2_prob) + ")", xloc = xloc.bar_index, yloc = yloc.price, color = c_sell_main, textcolor = color.white, style = label.style_label_left, textalign = text.align_left, size = size.small)
+    
+    array.push(sell_labels, label_sl)
+    array.push(sell_labels, label_entry)
+    array.push(sell_labels, label_tp1)
+    array.push(sell_labels, label_tp2)
+
+    if show_line_fill_active
+        fill_sl_entry = linefill.new(line_sl, line_entry, color=color.new(c_sell_main, 95))
+        fill_entry_tp2 = linefill.new(line_entry, line_tp2, color=color.new(c_sell_main, 95)) // RED FOR SELL
+        array.push(sell_fills, fill_sl_entry)
+        array.push(sell_fills, fill_entry_tp2)
+
+
+// --- Drawing Updates & History Management ---
+if is_buy_trade_active
+    current_line_end_x = bar_index + x
+    if array.size(buy_lines) > 0
+        for i = 0 to array.size(buy_lines) - 1
+            line.set_x2(array.get(buy_lines, i), current_line_end_x)
+    if array.size(buy_boxes) > 0
+        for i = 0 to array.size(buy_boxes) - 1
+            box.set_right(array.get(buy_boxes, i), current_line_end_x)
+    if array.size(buy_labels) > 0
+        for i = 0 to array.size(buy_labels) - 1
+            label.set_x(array.get(buy_labels, i), current_line_end_x)
+
+    if not tp1_was_hit_this_trade and not na(active_buy_tp1) and high >= active_buy_tp1
+        buy_tp1_hit_count += 1
+        tp1_was_hit_this_trade := true 
+
+    if not na(active_buy_tp2) and high >= active_buy_tp2
+        // WIN SCENARIO
+        if not (low <= active_buy_sl) 
+            buy_win_count_tp2 += 1
+            label.new(bar_index, active_buy_tp2, "WIN", color=c_win, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+        else
+            buy_loss_count +=1 
+            label.new(bar_index, active_buy_sl, "LOSS", color=c_loss, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+        
+        is_buy_trade_active := false
+        f_snap_drawings_to_bar(buy_lines, buy_boxes, bar_index)
+        f_archive_active_drawings(buy_lines, buy_labels, buy_boxes, buy_fills)
+
+    else if not na(active_buy_sl) and low <= active_buy_sl
+        // LOSS SCENARIO
+        buy_loss_count += 1
+        label.new(bar_index, active_buy_sl, "LOSS", color=c_loss, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+        
+        is_buy_trade_active := false
+        f_snap_drawings_to_bar(buy_lines, buy_boxes, bar_index)
+        f_archive_active_drawings(buy_lines, buy_labels, buy_boxes, buy_fills)
+
+
+if is_sell_trade_active
+    current_line_end_x = bar_index + x
+    if array.size(sell_lines) > 0
+        for i = 0 to array.size(sell_lines) - 1
+            line.set_x2(array.get(sell_lines, i), current_line_end_x)
+    if array.size(sell_boxes) > 0
+        for i = 0 to array.size(sell_boxes) - 1
+            box.set_right(array.get(sell_boxes, i), current_line_end_x)
+    if array.size(sell_labels) > 0
+        for i = 0 to array.size(sell_labels) - 1
+            label.set_x(array.get(sell_labels, i), current_line_end_x)
+
+    if not tp1_was_hit_this_trade and not na(active_sell_tp1) and low <= active_sell_tp1
+        sell_tp1_hit_count += 1
+        tp1_was_hit_this_trade := true 
+
+    if not na(active_sell_tp2) and low <= active_sell_tp2
+        // WIN SCENARIO
+        if not (high >= active_sell_sl) 
+            sell_win_count_tp2 += 1
+            label.new(bar_index, active_sell_tp2, "WIN", color=c_win, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+        else
+            sell_loss_count += 1 
+            label.new(bar_index, active_sell_sl, "LOSS", color=c_loss, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+        is_sell_trade_active := false
+        f_snap_drawings_to_bar(sell_lines, sell_boxes, bar_index)
+        f_archive_active_drawings(sell_lines, sell_labels, sell_boxes, sell_fills)
+
+    else if not na(active_sell_sl) and high >= active_sell_sl
+        // LOSS SCENARIO
+        sell_loss_count += 1
+        label.new(bar_index, active_sell_sl, "LOSS", color=c_loss, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+        
+        is_sell_trade_active := false
+        f_snap_drawings_to_bar(sell_lines, sell_boxes, bar_index)
+        f_archive_active_drawings(sell_lines, sell_labels, sell_boxes, sell_fills)
+
+
+// === MTF Status Dashboard ===
+// Helper function to get cell colors (Background Tint + Text Color) - MUST BE OUTSIDE IF BLOCK
+f_get_dash_colors(is_buy, is_sell) =>
+    mtf_neutral_bg = c_text_dark 
+    mtf_neutral_txt = color.gray
+    bg_c = is_buy ? color.new(c_buy_main, 80) : is_sell ? color.new(c_sell_main, 80) : mtf_neutral_bg
+    txt_c = is_buy ? c_buy_main : is_sell ? c_sell_main : mtf_neutral_txt
+    [bg_c, txt_c]
+
+if not backtesting_mode
+    m1_buy_active_dash = nz(request.security(syminfo.tickerid, "1", is_buy_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    m1_sell_active_dash = nz(request.security(syminfo.tickerid, "1", is_sell_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    m5_buy_active_dash = nz(request.security(syminfo.tickerid, "5", is_buy_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    m5_sell_active_dash = nz(request.security(syminfo.tickerid, "5", is_sell_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    m15_buy_active_dash = nz(request.security(syminfo.tickerid, "15", is_buy_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    m15_sell_active_dash = nz(request.security(syminfo.tickerid, "15", is_sell_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    m30_buy_active_dash = nz(request.security(syminfo.tickerid, "30", is_buy_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    m30_sell_active_dash = nz(request.security(syminfo.tickerid, "30", is_sell_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    h1_buy_active_dash = nz(request.security(syminfo.tickerid, "60", is_buy_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    h1_sell_active_dash = nz(request.security(syminfo.tickerid, "60", is_sell_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    h4_buy_active_dash = nz(request.security(syminfo.tickerid, "240", is_buy_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    h4_sell_active_dash = nz(request.security(syminfo.tickerid, "240", is_sell_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    d1_buy_active_dash = nz(request.security(syminfo.tickerid, "D", is_buy_trade_active[1], lookahead = barmerge.lookahead_off), false)
+    d1_sell_active_dash = nz(request.security(syminfo.tickerid, "D", is_sell_trade_active[1], lookahead = barmerge.lookahead_off), false)
+
+    // UPDATED DASHBOARD LOGIC (MATCHING BOTTOM STYLE)
+    var table mtf_dashboard = table.new(position.top_right, 7, 1, border_width = 1, border_color=color.new(color.gray, 80), bgcolor = c_text_dark)
+
+    if barstate.islast
+        [m1_bg, m1_txt] = f_get_dash_colors(m1_buy_active_dash, m1_sell_active_dash)
+        table.cell(mtf_dashboard, 0, 0, "M1", bgcolor = m1_bg, text_color = m1_txt, text_size = size.small)
+
+        [m5_bg, m5_txt] = f_get_dash_colors(m5_buy_active_dash, m5_sell_active_dash)
+        table.cell(mtf_dashboard, 1, 0, "M5", bgcolor = m5_bg, text_color = m5_txt, text_size = size.small)
+
+        [m15_bg, m15_txt] = f_get_dash_colors(m15_buy_active_dash, m15_sell_active_dash)
+        table.cell(mtf_dashboard, 2, 0, "M15", bgcolor = m15_bg, text_color = m15_txt, text_size = size.small)
+
+        [m30_bg, m30_txt] = f_get_dash_colors(m30_buy_active_dash, m30_sell_active_dash)
+        table.cell(mtf_dashboard, 3, 0, "M30", bgcolor = m30_bg, text_color = m30_txt, text_size = size.small)
+
+        [h1_bg, h1_txt] = f_get_dash_colors(h1_buy_active_dash, h1_sell_active_dash)
+        table.cell(mtf_dashboard, 4, 0, "H1", bgcolor = h1_bg, text_color = h1_txt, text_size = size.small)
+
+        [h4_bg, h4_txt] = f_get_dash_colors(h4_buy_active_dash, h4_sell_active_dash)
+        table.cell(mtf_dashboard, 5, 0, "H4", bgcolor = h4_bg, text_color = h4_txt, text_size = size.small)
+
+        [d1_bg, d1_txt] = f_get_dash_colors(d1_buy_active_dash, d1_sell_active_dash)
+        table.cell(mtf_dashboard, 6, 0, "D1", bgcolor = d1_bg, text_color = d1_txt, text_size = size.small)
+
+// === STATS DASHBOARD ===
+var table results_table = table.new(position.bottom_right, 3, 3, border_width = 1, border_color = color.new(color.gray, 90), bgcolor = c_text_dark)
+
+if barstate.islast
+    local_total_buy_trades = buy_win_count_tp2 + buy_loss_count
+    local_total_sell_trades = sell_win_count_tp2 + sell_loss_count
+
+    wr_tp1_buy_final = local_total_buy_trades > 0 ? (buy_tp1_hit_count / local_total_buy_trades) * 100 : 0.0
+    wr_tp1_sell_final = local_total_sell_trades > 0 ? (sell_tp1_hit_count / local_total_sell_trades) * 100 : 0.0
+    wr_tp2_buy_final = local_total_buy_trades > 0 ? (buy_win_count_tp2 / local_total_buy_trades) * 100 : 0.0
+    wr_tp2_sell_final = local_total_sell_trades > 0 ? (sell_win_count_tp2 / local_total_sell_trades) * 100 : 0.0 
+
+    // Determine which columns to show based on signal filter
+    show_buy_stats = signal_filter == "All Signals" or signal_filter == "BUY Only"
+    show_sell_stats = signal_filter == "All Signals" or signal_filter == "SELL Only"
+    
+    // Build table based on filter
+    if signal_filter == "All Signals"
+        // Original 3-column layout
+        table.cell(results_table, 1, 0, "BUY", bgcolor = color.new(c_buy_main, 80), text_color = c_buy_main, text_size = size.small)
+        table.cell(results_table, 2, 0, "SELL", bgcolor = color.new(c_sell_main, 80), text_color = c_sell_main, text_size = size.small)
+
+        table.cell(results_table, 0, 1, "TP1 Prob.", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(results_table, 1, 1, f_format_pct(wr_tp1_buy_final), text_color = color.white, text_size = size.small)
+        table.cell(results_table, 2, 1, f_format_pct(wr_tp1_sell_final), text_color = color.white, text_size = size.small)
+
+        table.cell(results_table, 0, 2, "TP2 Prob.", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(results_table, 1, 2, f_format_pct(wr_tp2_buy_final), text_color = color.white, text_size = size.small)
+        table.cell(results_table, 2, 2, f_format_pct(wr_tp2_sell_final), text_color = color.white, text_size = size.small)
+    
+    else if signal_filter == "BUY Only"
+        // 2-column layout (label + BUY only)
+        table.cell(results_table, 1, 0, "BUY", bgcolor = color.new(c_buy_main, 80), text_color = c_buy_main, text_size = size.small)
+        
+        table.cell(results_table, 0, 1, "TP1 Prob.", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(results_table, 1, 1, f_format_pct(wr_tp1_buy_final), text_color = color.white, text_size = size.small)
+        
+        table.cell(results_table, 0, 2, "TP2 Prob.", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(results_table, 1, 2, f_format_pct(wr_tp2_buy_final), text_color = color.white, text_size = size.small)
+    
+    else if signal_filter == "SELL Only"
+        // 2-column layout (label + SELL only)
+        table.cell(results_table, 1, 0, "SELL", bgcolor = color.new(c_sell_main, 80), text_color = c_sell_main, text_size = size.small)
+        
+        table.cell(results_table, 0, 1, "TP1 Prob.", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(results_table, 1, 1, f_format_pct(wr_tp1_sell_final), text_color = color.white, text_size = size.small)
+        
+        table.cell(results_table, 0, 2, "TP2 Prob.", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(results_table, 1, 2, f_format_pct(wr_tp2_sell_final), text_color = color.white, text_size = size.small)
+
+// === ATR Offset for Labels ===
+atr_value = ta.atr(atr_len_input)
+vertical_offset_atr = atr_value * atr_offset_mult
+
+// === Plot Signal Labels ===
+if buy_signal_condition and not is_buy_trade_active[1] and not is_sell_trade_active[1]
+    label.new(x=bar_index[1], y=low[1] - vertical_offset_atr,
+              text="BUY", style=label.style_label_up,
+              color=c_buy_main, textcolor=color.white,
+              size=signal_label_size, yloc=yloc.price, textalign = text.align_center, tooltip="BUY Signal")
+
+if sell_signal_condition and not is_buy_trade_active[1] and not is_sell_trade_active[1]
+    label.new(x=bar_index[1], y=high[1] + vertical_offset_atr,
+              text="SELL", style=label.style_label_down,
+              color=c_sell_main, textcolor=color.white,
+              size=signal_label_size, yloc=yloc.price, textalign = text.align_center, tooltip="SELL Signal")
+
+// === Candle Coloring Logic ===
+
+// Recalculate confirmation logic for CURRENT bar (not [1])
+cur_body_size = math.abs(close - open)
+cur_candle_range = high - low
+cur_body_to_range_ratio = cur_candle_range > 0 ? cur_body_size / cur_candle_range : 0
+cur_bull_confirm = not na(updated_buy_fractal_level) and close > open and close > updated_buy_fractal_level and cur_body_to_range_ratio > 0.5
+cur_bear_confirm = not na(updated_sell_fractal_level) and close < open and close < updated_sell_fractal_level and cur_body_to_range_ratio > 0.5
+
+// Current bar filters
+cur_highest_high_filter = ta.highest(high, filter_lookback)
+cur_lowest_low_filter = ta.lowest(low, filter_lookback)
+cur_buy_close_filter = close > cur_highest_high_filter[1]
+cur_sell_close_filter = close < cur_lowest_low_filter[1]
+
+// TP1 filters for current bar
+cur_potential_buy_tp1 = na(updated_buy_fractal_level) or na(lowest_low) ? na : updated_buy_fractal_level + (updated_buy_fractal_level - lowest_low)
+cur_potential_sell_tp1 = na(updated_sell_fractal_level) or na(highest_high) ? na : updated_sell_fractal_level - (highest_high - updated_sell_fractal_level)
+cur_buy_tp1_filter = na(cur_potential_buy_tp1) ? true : high < cur_potential_buy_tp1
+cur_sell_tp1_filter = na(cur_potential_sell_tp1) ? true : low > cur_potential_sell_tp1
+
+// Blue candle conditions (checking CURRENT bar in real-time)
+is_buy_signal_bar_now = not buy_signal_triggered and recent_crossover_30 and 
+     not na(updated_buy_fractal_level) and not na(lowest_low) and not na(last_up_fractal_index) and 
+     (updated_buy_fractal_level - lowest_low) > 0 and close > updated_buy_fractal_level and 
+     cur_bull_confirm and cur_buy_close_filter and cur_buy_tp1_filter
+
+is_sell_signal_bar_now = not sell_signal_triggered and recent_crossover_70 and 
+     not na(updated_sell_fractal_level) and not na(highest_high) and not na(last_down_fractal_index) and 
+     (highest_high - updated_sell_fractal_level) > 0 and close < updated_sell_fractal_level and 
+     cur_bear_confirm and cur_sell_close_filter and cur_sell_tp1_filter
+
+var color candle_color = na
+
+if is_buy_trade_active
+    candle_color := c_buy_main 
+else if is_sell_trade_active
+    candle_color := c_sell_main
+else if is_buy_signal_bar_now or is_sell_signal_bar_now
+    candle_color := c_signal_bar 
+else
+    // NEUTRAL STATE
+    if enable_grey_candles
+        candle_color := c_candle_neutral
+    else
+        candle_color := close >= open ? #089981 : #F23645
+
+plotcandle(open, high, low, close, title="Price Candles",
+     color = candle_color,
+     wickcolor = candle_color,
+     bordercolor = candle_color
+     )
+
+
+// === ALERTS ===
+if enable_alerts and buy_signal_condition and not is_buy_trade_active[1] and not is_sell_trade_active[1]
+    alert('{"secret":"quantio_tv_9f2a7c8d91a34b","symbol":"' + syminfo.ticker + '","market":"forex","side":"buy","entry":' + str.tostring(updated_buy_fractal_level[1]) + ',"tp1":' + str.tostring(updated_buy_fractal_level[1] + (updated_buy_fractal_level[1] - lowest_low[1])) + ',"tp2":' + str.tostring(updated_buy_fractal_level[1] + 2 * (updated_buy_fractal_level[1] - lowest_low[1])) + ',"sl":' + str.tostring(lowest_low[1]) + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
+
+if enable_alerts and sell_signal_condition and not is_buy_trade_active[1] and not is_sell_trade_active[1]
+    alert('{"secret":"quantio_tv_9f2a7c8d91a34b","symbol":"' + syminfo.ticker + '","market":"forex","side":"sell","entry":' + str.tostring(updated_sell_fractal_level[1]) + ',"tp1":' + str.tostring(updated_sell_fractal_level[1] - (highest_high[1] - updated_sell_fractal_level[1])) + ',"tp2":' + str.tostring(updated_sell_fractal_level[1] - 2 * (highest_high[1] - updated_sell_fractal_level[1])) + ',"sl":' + str.tostring(highest_high[1]) + ',"timeframe":"' + timeframe.period + '"}', alert.freq_once_per_bar_close)
